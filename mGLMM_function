@@ -1,0 +1,263 @@
+library(dplyr)
+library(tidyr)
+library(joineRML)
+library(survival)
+library(pROC)
+library(mvtnorm)
+library(numDeriv)
+library(parallel)
+
+set.seed(2024)
+
+n_cores <- detectCores() - 1
+
+# load renal data (joineRML)
+data(renal)
+
+prot <- renal$prot
+heam <- renal$haem
+gfr  <- renal$gfr
+surv <- renal$surv
+
+# choose a landmark time
+t_landmark <- 2
+
+# keep only subject still at risk at landmark time
+risk_set <- surv %>%
+  filter(fuyears >= t_landmark) %>%
+  pull(id)
+
+gfr_long <- gfr %>%
+  filter(id %in% risk_set, years <= t_landmark) %>%
+  mutate(biomarker = "gfr", y = gfr) %>%
+  select(id, biomarker, years, y)
+
+heam_long <- heam %>%
+  filter(id %in% risk_set, years <= t_landmark) %>%
+  mutate(biomarker = "heam", y = haematocrit) %>%
+  select(id, biomarker, years, y)
+
+prot_long <- prot %>%
+  filter(id %in% risk_set, years <= t_landmark) %>%
+  mutate(biomarker = "prot", y = proteinuria) %>%
+  select(id, biomarker, years, y)
+
+# dataset in long format
+data_stacked <- bind_rows(gfr_long, heam_long, prot_long) %>%
+  arrange(id, biomarker, years) %>%
+  mutate(biomarker = factor(biomarker, levels = c("gfr", "heam", "prot")))
+
+surv_at_landmark <- surv %>%
+  filter(id %in% risk_set) %>%
+  mutate(time_landmark = pmax(fuyears - t_landmark, 0))
+
+
+reconstruct_G_from_cholesky <- function(theta_L) {
+  L <- matrix(0, 6, 6)
+  L[lower.tri(L, diag = TRUE)] <- theta_L
+  L %*% t(L)
+}
+
+# log-verosimiglianza condizionata ai random effects per un soggetto
+loglik_conditional <- function(b_i, data_subj, gamma_gfr, gamma_heam, gamma_prot, G) {
+  
+  ll_cond <- 0
+  
+  data_gfr <- data_subj %>% filter(biomarker == "gfr")
+  if (nrow(data_gfr) > 0) {
+    y_gfr <- data_gfr$y
+    t_gfr <- data_gfr$years
+    mu_gfr <- gamma_gfr[1] + gamma_gfr[2] * t_gfr + b_i[1] + b_i[2] * t_gfr
+    ll_cond <- ll_cond + sum(dnorm(y_gfr, mean = mu_gfr, sd = 1, log = TRUE))
+  }
+  
+  data_heam <- data_subj %>% filter(biomarker == "heam")
+  if (nrow(data_heam) > 0) {
+    y_heam <- data_heam$y
+    t_heam <- data_heam$years
+    mu_heam <- gamma_heam[1] + gamma_heam[2] * t_heam + b_i[3] + b_i[4] * t_heam
+    ll_cond <- ll_cond + sum(dnorm(y_heam, mean = mu_heam, sd = 1, log = TRUE))
+  }
+  
+  data_prot <- data_subj %>% filter(biomarker == "prot")
+  if (nrow(data_prot) > 0) {
+    y_prot <- data_prot$y
+    t_prot <- data_prot$years
+    eta_prot <- gamma_prot[1] + gamma_prot[2] * t_prot + b_i[5] + b_i[6] * t_prot
+    p_prot <- plogis(eta_prot)
+    p_prot <- pmax(pmin(p_prot, 1 - 1e-10), 1e-10)
+    ll_cond <- ll_cond + sum(dbinom(y_prot, size = 1, prob = p_prot, log = TRUE))
+  }
+  
+  ll_prior <- dmvnorm(t(b_i), mean = rep(0, 6), sigma = G, log = TRUE)
+  ll_cond + ll_prior
+}
+
+# approssimazione di Laplace per la verosimiglianza marginale del soggetto subj_id
+optimize_subject_laplace <- function(subj_id, data_stacked, gamma_gfr, gamma_heam, gamma_prot, G) {
+  
+  data_subj <- data_stacked %>% filter(id == subj_id)
+  
+  loglik_cond_wrapper <- function(b) {
+    loglik_conditional(b, data_subj, gamma_gfr, gamma_heam, gamma_prot, G)
+  }
+  
+  b_i_start <- rep(0, 6)
+  
+  optim_result <- tryCatch({
+    optim(b_i_start, function(b) -loglik_cond_wrapper(b),
+          method = "BFGS", control = list(maxit = 100, reltol = 1e-6))
+  }, error = function(e) {
+    list(par = b_i_start, convergence = 1, value = 1e10)
+  })
+  
+  if (optim_result$convergence != 0) return(NA)
+  
+  b_i_mode    <- optim_result$par
+  loglik_mode <- -optim_result$value
+  
+  hess <- tryCatch({
+    hessian(loglik_cond_wrapper, b_i_mode)
+  }, error = function(e) {
+    diag(6) * 1e-6
+  })
+  
+  det_neg_hess <- det(-hess)
+  
+  if (det_neg_hess > 1e-10) {
+    log_det_term <- 0.5 * log(det_neg_hess)
+    log_laplace <- loglik_mode + 3 * log(2 * pi) + log_det_term
+  } else {
+    log_laplace <- loglik_mode
+  }
+  
+  log_laplace
+}
+
+# negativo della log-verosimiglianza marginale del mGLMM (somma sui soggetti)
+nloglik_mglmm <- function(theta, data_stacked, verbose = FALSE) {
+  
+  gamma_gfr  <- theta[1:2]
+  gamma_heam <- theta[3:4]
+  gamma_prot <- theta[5:6]
+  theta_L    <- theta[7:length(theta)]
+  
+  G <- reconstruct_G_from_cholesky(theta_L)
+  
+  eigvals <- eigen(G)$values
+  if (any(eigvals < 1e-6)) return(1e10)
+  
+  subjects <- unique(data_stacked$id)
+  
+  log_likelihoods <- mclapply(subjects, function(subj_id) {
+    optimize_subject_laplace(subj_id, data_stacked, gamma_gfr, gamma_heam, gamma_prot, G)
+  }, mc.cores = n_cores, mc.silent = TRUE)
+  
+  ll <- sum(unlist(log_likelihoods), na.rm = TRUE)
+  -ll
+}
+
+# valori iniziali per i parametri fissi (media campionaria, slope nulla)
+gamma_gfr_start  <- c(mean(gfr$gfr, na.rm = TRUE), 0)
+gamma_heam_start <- c(mean(heam$haematocrit, na.rm = TRUE), 0)
+gamma_prot_start <- c(mean(prot$proteinuria, na.rm = TRUE), 0)
+
+L_start <- matrix(0, 6, 6)
+diag(L_start) <- c(1, 0.5, 1, 0.5, 1, 0.5)
+L_start[lower.tri(L_start)] <- 0.1
+theta_L_start <- L_start[lower.tri(L_start, diag = TRUE)]
+
+theta_start <- c(gamma_gfr_start, gamma_heam_start, gamma_prot_start, theta_L_start)
+
+print("Starting optimization...")
+print(paste("Number of parameters:", length(theta_start)))
+
+start_time <- Sys.time()
+
+result_optim <- optim(
+  theta_start,
+  nloglik_mglmm,
+  data_stacked = data_stacked,
+  verbose = FALSE,
+  method = "BFGS",
+  control = list(maxit = 200, trace = 1, reltol = 1e-4)
+)
+
+end_time <- Sys.time()
+
+cat("\n")
+print("Optimization result:")
+print(paste("Convergence:", result_optim$convergence))
+print(paste("Final negative log-likelihood:", round(result_optim$value, 2)))
+print(paste("Time:", round(difftime(end_time, start_time, units = "mins"), 2), "minutes"))
+
+theta_hat <- result_optim$par
+
+gamma_gfr  <- theta_hat[1:2]
+gamma_heam <- theta_hat[3:4]
+gamma_prot <- theta_hat[5:6]
+
+theta_L_hat <- theta_hat[7:length(theta_hat)]
+G_hat <- reconstruct_G_from_cholesky(theta_L_hat)
+
+# ricalcolo i random effects (BLUP) usando le stime finali di G e gamma
+subjects <- unique(data_stacked$id)
+
+ranef_list <- mclapply(subjects, function(subj_id) {
+  
+  data_subj <- data_stacked %>% filter(id == subj_id)
+  
+  loglik_cond_wrapper <- function(b) {
+    loglik_conditional(b, data_subj, gamma_gfr, gamma_heam, gamma_prot, G_hat)
+  }
+  
+  b_i_start <- rep(0, 6)
+  
+  optim_result <- tryCatch({
+    optim(b_i_start, function(b) -loglik_cond_wrapper(b),
+          method = "BFGS", control = list(maxit = 100, reltol = 1e-6))
+  }, error = function(e) {
+    list(par = b_i_start, convergence = 1)
+  })
+  
+  b_i_mode <- optim_result$par
+  
+  data.frame(
+    id = subj_id,
+    b_gfr_0 = b_i_mode[1], b_gfr_1 = b_i_mode[2],
+    b_heam_0 = b_i_mode[3], b_heam_1 = b_i_mode[4],
+    b_prot_0 = b_i_mode[5], b_prot_1 = b_i_mode[6],
+    stringsAsFactors = FALSE
+  )
+  
+}, mc.cores = n_cores, mc.silent = TRUE)
+
+ranef_all <- bind_rows(ranef_list)
+
+# unisco i random effects ai dati di sopravvivenza al landmark, per il modello successivo
+surv_working <- surv_at_landmark %>%
+  left_join(ranef_all, by = "id") %>%
+  mutate(
+    gender_numeric  = as.numeric(gender == "male"),
+    weight_centered = scale(weight)[, 1],
+    age_centered    = scale(age)[, 1],
+    q_i = 0.5
+  )
+
+eigvals_G <- eigen(G_hat)$values
+
+D_diag <- sqrt(diag(G_hat))
+Corr_hat <- diag(1 / D_diag) %*% G_hat %*% diag(1 / D_diag)
+
+mglmm_estimates <- list(
+  gamma_gfr = gamma_gfr,
+  gamma_heam = gamma_heam,
+  gamma_prot = gamma_prot,
+  G = G_hat,
+  ranef = ranef_all,
+  surv_working = surv_working,
+  t_landmark = t_landmark,
+  n_subjects = length(subjects)
+)
+
+save.image("mGLMM_estimates_tot.RData")
